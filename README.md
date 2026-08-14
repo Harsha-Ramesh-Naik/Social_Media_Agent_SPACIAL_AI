@@ -51,7 +51,7 @@ To get started, you'll need the following API keys/software:
 ### Clone the repository:
 
 ```bash
-git clone 
+git clone https://github.com/Harsha-Ramesh-Naik/Social_Media_Agent_SPACIAL_AI.git
 ```
 
 ```bash
@@ -87,8 +87,18 @@ FIRECRAWL_API_KEY=
 
 # Arcade API key - used for fetching Tweets, and scheduling LinkedIn/Twitter posts
 ARCADE_API_KEY=
-```
 
+USE_ARCADE_AUTH="true"
+USE_ARCADE_AUTH_TWITTER="false"
+USE_ARCADE_AUTH_LINKEDIN="true"
+USE_TWITTER_API_ONLY="true"
+```
+SOURCE_URL=
+
+TWITTER_API_KEY=
+TWITTER_API_KEY_SECRET=
+TWITTER_USER_TOKEN=
+TWITTER_USER_TOKEN_SECRET=
 
 ### Install LangGraph CLI
 
@@ -102,20 +112,12 @@ Then run the following command to check the CLI is installed:
 langgraph --version
 ```
 
-Click [here](https://langchain-ai.github.io/langgraph/cloud/reference/cli/) to read the full download instructions for the LangGraph CLI.
-
 ### Start the LangGraph server:
 
 To start the LangGraph server, run this script:
 
 ```bash
 yarn langgraph:in_mem:up
-```
-
-Under the hood, this will execute the following command:
-
-```bash
-npx @langchain/langgraph-cli dev --port 54367
 ```
 
 > [!NOTE]
@@ -151,7 +153,7 @@ To use all of the features of the Social Media Agent, you'll need the following:
 ### Clone the repository:
 
 ```bash
-git clone 
+git clone https://github.com/Harsha-Ramesh-Naik/Social_Media_Agent_SPACIAL_AI.git
 ```
 
 ```bash
@@ -305,37 +307,8 @@ There are two main prompts to modify to change the style of the posts.
 2. Few-shot examples (`TWEET_EXAMPLES`). These are the examples given to the LLM of which it's prompted to use as examples for style, content, tone and structure. This is arguably one of the most important parts of the prompt. Currently, these are set to a handful of Tweets by popular AI focused Twitter accounts. You should _definitely_ update these if you want to generate non-AI focused Tweets, instead with examples of Tweets/posts on your target content.
 3. "Business context" (`BUSINESS_CONTEXT`). This prompt is used widely throughout the agent to provide context into your main goal of the social media agent. For us at LangChain, this prompt is used to describe the different LangChain products and services. The default prompt is focused on AI content, but should be updated/edited to match your use case. This prompt is used in verifying content is relevant for you, generating marketing reports, and generating tweets.
 
-# Reference: Environment Variables, Mock vs. Live, & Limitations
+# Reference: Mock vs. Live, & Limitations
 
-## Environment Variables Configuration
-
-The following environment variables configure the social media agent. Ensure these are set in your `.env` file:
-
-| Variable | Description | Required / Optional |
-|---|---|---|
-| `LANGCHAIN_API_KEY` | LangSmith API key for monitoring, debugging, and tracing agent runs. | Optional (Recommended) |
-| `LANGCHAIN_TRACING_V2` | Set to `true` to enable tracing to LangSmith. | Optional |
-| `ANTHROPIC_API_KEY` | API key for Anthropic Claude (e.g., `claude-sonnet-4-5`) to generate posts and reports. | **Required** |
-| `FIRECRAWL_API_KEY` | API key for FireCrawl web scraping to extract text from submitted URLs. | **Required** |
-| `ARCADE_API_KEY` | API key for Arcade.dev to manage social authentication and post scheduling. | Required if `USE_ARCADE_AUTH="true"` |
-| `USE_ARCADE_AUTH` | Set to `"true"` to use Arcade OAuth authentication for publishing. | Optional |
-| `USE_ARCADE_AUTH_TWITTER` | Override to control whether Twitter uses Arcade auth. | Optional |
-| `USE_ARCADE_AUTH_LINKEDIN` | Override to control whether LinkedIn uses Arcade auth. | Optional |
-| `USE_TWITTER_API_ONLY` | Force direct Twitter API client authentication. | Optional |
-| `TWITTER_API_KEY` / `TWITTER_API_KEY_SECRET` | Developer App key credentials for direct Twitter authentication. | Required if not using Arcade |
-| `TWITTER_USER_TOKEN` / `TWITTER_USER_TOKEN_SECRET` | User access token credentials for posting to a specific Twitter profile. | Required if not using Arcade |
-| `LINKEDIN_ACCESS_TOKEN` | OAuth Access Token for direct LinkedIn posting. | Required if not using Arcade |
-| `LINKEDIN_PERSON_URN` | Person URN (e.g., `urn:li:person:abc`) for your LinkedIn user account. | Required if not using Arcade |
-| `POST_TO_LINKEDIN_ORGANIZATION` | Set to `"true"` if you want posts published on behalf of a company page. | Optional |
-| `LINKEDIN_ORGANIZATION_ID` | The ID of the LinkedIn company page admin account. | Required if posting to LinkedIn Org |
-| `TWITTER_USER_ID` / `LINKEDIN_USER_ID` | Email/Username used for user lookup when connecting via Arcade auth. | Required for Arcade |
-| `SKIP_CONTENT_RELEVANCY_CHECK` | Set to `"true"` to bypass content checks and accept all input URLs. | Optional |
-| `SKIP_USED_URLS_CHECK` | Set to `"true"` to skip verification of whether a URL was previously posted. | Optional |
-| `GITHUB_TOKEN` | Personal access token (read-only) for fetching details of GitHub URLs. | Required for GitHub URLs |
-| `SOURCE_URL` | The fallback URL processed by the agent when running `yarn generate_post`. | Optional |
-| `ENABLE_INSTAGRAM_UPLOAD` | Set to `"true"` to enable automatic Instagram posting (disabled by default). | Optional |
-
----
 
 ## What's Mocked vs. Live
 
