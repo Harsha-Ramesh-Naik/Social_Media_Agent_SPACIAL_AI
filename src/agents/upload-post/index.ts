@@ -1,0 +1,618 @@
+import {
+  Annotation,
+  END,
+  LangGraphRunnableConfig,
+  START,
+  StateGraph,
+} from "@langchain/langgraph";
+import { TwitterClient } from "../../clients/twitter/client.js";
+
+
+import { getPlatformPost } from "../generate-post/nodes/generate-post/utils.js";
+import {
+  imageUrlToBuffer,
+  isTextOnly,
+  shouldPostToLinkedInOrg,
+  useArcadeAuthForLinkedIn,
+  useArcadeAuthForTwitter,
+  useTwitterApiOnly,
+  useLangChainPrompts,
+} from "../utils.js";
+import { CreateMediaRequest } from "../../clients/twitter/types.js";
+import { LinkedInClient } from "../../clients/linkedin.js";
+import { InstagramClient } from "../../clients/instagram.js";
+import {
+  LINKEDIN_ACCESS_TOKEN,
+  LINKEDIN_ORGANIZATION_ID,
+  LINKEDIN_PERSON_URN,
+  POST_TO_LINKEDIN_ORGANIZATION,
+  TEXT_ONLY_MODE,
+  TWITTER_MAIN_USER_TOKEN,
+  TWITTER_MAIN_USER_TOKEN_SECRET,
+  LINKEDIN_MAIN_ACCESS_TOKEN,
+  LINKEDIN_MAIN_ORGANIZATION_ID,
+  INSTAGRAM_ACCESS_TOKEN,
+  INSTAGRAM_BUSINESS_ACCOUNT_ID,
+} from "../generate-post/constants.js";
+import { TwitterApi } from "twitter-api-v2";
+import { SlackClient } from "../../clients/slack/client.js";
+import { ComplexPost } from "../shared/nodes/generate-post/types.js";
+
+async function getMediaFromImage(image?: {
+  imageUrl: string;
+  mimeType: string;
+}): Promise<CreateMediaRequest | undefined> {
+  if (!image) return undefined;
+  const { buffer, contentType } = await imageUrlToBuffer(image.imageUrl);
+  return {
+    media: buffer,
+    mimeType: contentType,
+  };
+}
+
+export function ensureSignature(text: string): string {
+  const prefix = process.env.POST_SPOTLIGHT_PREFIX !== undefined
+    ? process.env.POST_SPOTLIGHT_PREFIX
+    : (useLangChainPrompts() ? "LangChain Community Spotlight:" : "");
+
+  let result = text.replace(/\n*Made by the LangChain Community\n*/gi, "\n\n");
+  result = result.replace(/^\n+/, "");
+  result = result.replace(/\n+$/, "");
+  result = result.replace(/\n{3,}/g, "\n\n");
+
+  if (prefix && !result.toLowerCase().includes(prefix.toLowerCase())) {
+    result = `${prefix} ${result}`;
+  }
+
+  return result;
+}
+
+export function sanitizeTwitterPostForUpload(text: string): string {
+  let result = text
+    .replace(/\r/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/\s+$/g, "")
+    .trim();
+
+  result = result.replace(/^LangChain Community Spotlight:\s*/i, "").trim();
+
+  if (!result) {
+    return "New update from LangChain Community";
+  }
+
+  if (result.length > 220) {
+    result = `${result.slice(0, 217).trimEnd()}...`;
+  }
+
+  return result;
+}
+
+/**
+ * Appends the original source URL to a Twitter post while respecting Twitter's 280-character limit.
+ *
+ * Twitter wraps every URL to exactly 23 characters via t.co, regardless of actual URL length.
+ * IMPORTANT: this function must be called AFTER ensureSignature(), because the signature chars
+ * count toward the 280-character budget.
+ *
+ * Budget breakdown:
+ *   280 total
+ *  - 23  URL (Twitter counts any URL as 23 chars via t.co)
+ *  -  2  separator ("\n\n")
+ *  ────
+ *   255  maximum body characters (already signed)
+ *
+ * The LLM often includes the URL at the end of the generated body. This function first strips
+ * any existing full OR partial URL (e.g. just "https") from the body before trimming, so the
+ * URL is never accidentally cut in half.
+ */
+export function appendOriginalLinkForTwitter(text: string, originalLink: string | undefined): string {
+  if (!originalLink) return text;
+
+  // Twitter counts every URL as exactly 23 chars regardless of actual length (t.co)
+  const TWITTER_MAX = 280;
+  const TWITTER_URL_CHARS = 23;
+  const SEPARATOR = "\n\n";
+  const maxBodyLength = TWITTER_MAX - SEPARATOR.length - TWITTER_URL_CHARS; // 255
+
+  // Step 1: Strip the full original URL from the body if it already appears there
+  let body = text.replace(originalLink, "").trimEnd();
+
+  // Step 2: Strip any trailing partial URL fragment (e.g. "https", "https://blog", etc.)
+  //         that the LLM may have included and that got cut off during prior truncation
+  body = body.replace(/\s*https?:\/\/\S*$/, "").trimEnd();
+  body = body.replace(/\s*https?:?\/?$/, "").trimEnd();
+
+  // Step 3: Trim body to fit within the 255-char budget
+  if (body.length > maxBodyLength) {
+    body = `${body.slice(0, maxBodyLength - 3).trimEnd()}...`;
+  }
+
+  return `${body}${SEPARATOR}${originalLink}`;
+}
+
+async function tryUploadTweetWithRetry(
+  twitterClient: TwitterClient,
+  text: string,
+  mediaBuffer?: CreateMediaRequest,
+  originalLink?: string,
+): Promise<any> {
+  // Step 1: apply signature prefix
+  const signed = ensureSignature(text);
+  // Step 2: append original URL, trimming body text to fit within 280 chars
+  //         (Twitter counts every URL as exactly 23 chars via t.co)
+  const finalText = appendOriginalLinkForTwitter(signed, originalLink);
+
+  try {
+    return await twitterClient.uploadTweet({
+      text: finalText,
+      ...(mediaBuffer && { media: mediaBuffer }),
+    });
+  } catch (error: any) {
+    const isForbidden =
+      error?.status === 403 ||
+      error?.code === 403 ||
+      /403|not permitted to perform this action/i.test(
+        `${error?.message || error?.detail || error || ""}`,
+      );
+
+    if (!isForbidden) {
+      throw error;
+    }
+
+    console.warn(
+      "Twitter upload rejected with 403; retrying with a shorter text-only payload.",
+    );
+
+    return await twitterClient.uploadTweet({
+      text: sanitizeTwitterPostForUpload(finalText),
+    });
+  }
+}
+
+async function retweetFromMainAccount(tweetId: string): Promise<void> {
+  const mainUserToken = process.env[TWITTER_MAIN_USER_TOKEN];
+  const mainUserTokenSecret = process.env[TWITTER_MAIN_USER_TOKEN_SECRET];
+
+  if (!mainUserToken || !mainUserTokenSecret) {
+    console.log(
+      "Main Twitter account credentials not configured. Skipping retweet.",
+    );
+    return;
+  }
+
+  if (!process.env.TWITTER_API_KEY || !process.env.TWITTER_API_KEY_SECRET) {
+    console.warn("Twitter API keys not configured. Skipping retweet.");
+    return;
+  }
+
+  try {
+    const mainClient = new TwitterApi({
+      appKey: process.env.TWITTER_API_KEY,
+      appSecret: process.env.TWITTER_API_KEY_SECRET,
+      accessToken: mainUserToken,
+      accessSecret: mainUserTokenSecret,
+    });
+
+    const me = await mainClient.v2.me();
+    await mainClient.v2.retweet(me.data.id, tweetId);
+    console.log("✅ Successfully retweeted from main Twitter account ✅");
+  } catch (error) {
+    console.error("Failed to retweet from main account (non-blocking):", error);
+  }
+}
+
+async function reshareFromMainLinkedInAccount(
+  originalPostUrn: string,
+): Promise<void> {
+  const mainAccessToken = process.env[LINKEDIN_MAIN_ACCESS_TOKEN];
+  const mainOrgId = process.env[LINKEDIN_MAIN_ORGANIZATION_ID];
+
+  if (!mainAccessToken || !mainOrgId) {
+    console.log(
+      "Main LinkedIn account credentials not configured. Skipping reshare.",
+    );
+    return;
+  }
+
+  try {
+    const reshareData = {
+      owner: `urn:li:organization:${mainOrgId}`,
+      resharedShare: originalPostUrn,
+      distribution: {
+        linkedInDistributionTarget: {},
+      },
+      text: {
+        text: "",
+      },
+    };
+
+    const response = await fetch("https://api.linkedin.com/v2/shares", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${mainAccessToken}`,
+        "Content-Type": "application/json",
+        "X-Restli-Protocol-Version": "2.0.0",
+      },
+      body: JSON.stringify(reshareData),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(
+        `LinkedIn reshare failed: ${response.status} ${errorText}`,
+      );
+    }
+
+    console.log("✅ Successfully reshared from main LinkedIn account ✅");
+  } catch (error) {
+    console.error(
+      "Failed to reshare from main LinkedIn account (non-blocking):",
+      error,
+    );
+  }
+}
+
+const UploadPostAnnotation = Annotation.Root({
+  post: Annotation<string>,
+  linkedinPost: Annotation<string | undefined>({
+    reducer: (_state, update) => update,
+    default: () => undefined,
+  }),
+  twitterPost: Annotation<string | undefined>({
+    reducer: (_state, update) => update,
+    default: () => undefined,
+  }),
+  instagramPost: Annotation<string | undefined>({
+    reducer: (_state, update) => update,
+    default: () => undefined,
+  }),
+  /**
+   * The original source URL the post was generated from.
+   * Used to append a reference link to Twitter and LinkedIn posts at upload time.
+   */
+  originalLink: Annotation<string | undefined>({
+    reducer: (_state, update) => update,
+    default: () => undefined,
+  }),
+  /**
+   * The complex post, if the user decides to split the URL from the main body.
+   *
+   * TODO: Refactor the post/complexPost state interfaces to use a single shared interface
+   * which includes images too.
+   * Tracking issue: https://github.com/langchain-ai/social-media-agent/issues/144
+   */
+  complexPost: Annotation<ComplexPost | undefined>,
+  image: Annotation<
+    | {
+      imageUrl: string;
+      mimeType: string;
+    }
+    | undefined
+  >,
+});
+
+const UploadPostGraphConfiguration = Annotation.Root({
+  [POST_TO_LINKEDIN_ORGANIZATION]: Annotation<boolean | undefined>,
+  /**
+   * Whether or not to use text only mode throughout the graph.
+   * If true, it will not try to extract, validate, or upload images.
+   * Additionally, it will not be able to handle validating YouTube videos.
+   * @default false
+   */
+  [TEXT_ONLY_MODE]: Annotation<boolean | undefined>({
+    reducer: (_state, update) => update,
+    default: () => false,
+  }),
+});
+
+interface PostUploadFailureToSlackArgs {
+  uploadDestination: "twitter" | "linkedin" | "instagram";
+  error: any;
+  threadId: string;
+  postContent: string | ComplexPost;
+  image?: {
+    imageUrl: string;
+    mimeType: string;
+  };
+}
+
+async function postUploadFailureToSlack({
+  uploadDestination,
+  error,
+  threadId,
+  postContent,
+  image,
+}: PostUploadFailureToSlackArgs) {
+  if (!process.env.SLACK_CHANNEL_ID) {
+    console.warn(
+      "No SLACK_CHANNEL_ID found in environment variables. Can not send error message to Slack.",
+    );
+    return;
+  }
+  const slackClient = new SlackClient();
+
+  const postStr =
+    typeof postContent === "string"
+      ? `Post:
+\`\`\`
+${postContent}
+\`\`\``
+      : `Main post:
+\`\`\`
+${postContent.main_post}
+\`\`\`
+Reply post:
+\`\`\`
+${postContent.reply_post}
+\`\`\``;
+
+  const slackMessageContent = `❌ FAILED TO UPLOAD POST TO ${uploadDestination.toUpperCase()} ❌
+
+Error message:
+\`\`\`
+${error}
+\`\`\`
+
+Thread ID: *${threadId}*
+
+${postStr}
+
+${image ? `Image:\nURL: ${image.imageUrl}\nMIME type: ${image.mimeType}` : ""}
+`;
+  await slackClient.sendMessage(
+    process.env.SLACK_CHANNEL_ID,
+    slackMessageContent,
+  );
+}
+
+export async function uploadPost(
+  state: typeof UploadPostAnnotation.State,
+  config: LangGraphRunnableConfig,
+): Promise<Partial<typeof UploadPostAnnotation.State>> {
+  if (!state.post) {
+    throw new Error("No post text found");
+  }
+  const isTextOnlyMode = isTextOnly(config);
+  const postToLinkedInOrg = shouldPostToLinkedInOrg(config);
+
+  // Derive the original source URL and a helper to append it to post bodies.
+  // Defined at function scope so both the Twitter and LinkedIn try-blocks can use it.
+  const originalLink = state.originalLink;
+  const appendOriginalLink = (text: string): string => {
+    if (!originalLink) return text;
+    if (text.includes(originalLink)) return text;
+    return `${text.trimEnd()}\n\nOriginal URL: ${originalLink}`;
+  };
+
+  try {
+    let twitterClient: TwitterClient;
+
+    if (useTwitterApiOnly() || !useArcadeAuthForTwitter()) {
+      twitterClient = TwitterClient.fromBasicTwitterAuth();
+    } else {
+      const twitterUserId = process.env.TWITTER_USER_ID;
+      if (!twitterUserId) {
+        throw new Error("Twitter user ID not found in configurable fields.");
+      }
+
+      const twitterToken = process.env.TWITTER_USER_TOKEN;
+      const twitterTokenSecret = process.env.TWITTER_USER_TOKEN_SECRET;
+
+      twitterClient = await TwitterClient.fromArcade(
+        twitterUserId,
+        {
+          twitterToken,
+          twitterTokenSecret,
+        },
+        {
+          textOnlyMode: isTextOnlyMode,
+        },
+      );
+    }
+
+    let mediaBuffer: CreateMediaRequest | undefined = undefined;
+    if (!isTextOnlyMode) {
+      mediaBuffer = await getMediaFromImage(state.image);
+    }
+
+    let tweetId: string | undefined;
+    const rawTwitterPost = state.twitterPost || getPlatformPost(state.post, "twitter");
+
+    if (state.complexPost) {
+      const threadResponse = await twitterClient.uploadThread([
+        {
+          text: ensureSignature(state.complexPost.main_post),
+          ...(mediaBuffer && { media: mediaBuffer }),
+        },
+        {
+          text: state.complexPost.reply_post,
+        },
+      ]);
+      tweetId = threadResponse[0]?.data?.id;
+    } else {
+      const tweetResponse = await tryUploadTweetWithRetry(
+        twitterClient,
+        rawTwitterPost,
+        mediaBuffer,
+        originalLink,
+      );
+      tweetId = tweetResponse.data?.id;
+    }
+
+    console.log("✅ Successfully uploaded Tweet ✅");
+
+    if (tweetId) {
+      await retweetFromMainAccount(tweetId);
+    }
+  } catch (e: any) {
+    console.error("Failed to upload post:", e);
+    let errorString = "";
+    if (typeof e === "object" && "message" in e) {
+      errorString = e.message;
+    } else {
+      errorString = e;
+    }
+    await postUploadFailureToSlack({
+      uploadDestination: "twitter",
+      error: errorString,
+      threadId:
+        config.configurable?.thread_id || "no thread id found in configurable",
+      postContent: state.complexPost || state.post,
+      image: state.image,
+    });
+  }
+
+  try {
+    let linkedInClient: LinkedInClient;
+
+    if (useArcadeAuthForLinkedIn()) {
+      const linkedInUserId = process.env.LINKEDIN_USER_ID;
+      if (!linkedInUserId) {
+        throw new Error("LinkedIn user ID not found in configurable fields.");
+      }
+
+      linkedInClient = await LinkedInClient.fromArcade(linkedInUserId, {
+        postToOrganization: postToLinkedInOrg,
+      });
+    } else {
+      const accessToken =
+        process.env.LINKEDIN_ACCESS_TOKEN ||
+        config.configurable?.[LINKEDIN_ACCESS_TOKEN];
+      if (!accessToken) {
+        throw new Error(
+          "LinkedIn access token not found in environment or configurable fields. Either set it, or use Arcade Auth.",
+        );
+      }
+
+      const personUrn =
+        process.env.LINKEDIN_PERSON_URN ||
+        config.configurable?.[LINKEDIN_PERSON_URN];
+      const organizationId =
+        process.env.LINKEDIN_ORGANIZATION_ID ||
+        config.configurable?.[LINKEDIN_ORGANIZATION_ID];
+      linkedInClient = new LinkedInClient({
+        accessToken: accessToken,
+        personUrn: personUrn,
+        organizationId: organizationId,
+      });
+    }
+
+    let linkedInPostUrn: string | undefined;
+    const linkedInPostText = appendOriginalLink(
+      state.linkedinPost || getPlatformPost(state.post, "linkedin")
+    );
+
+    if (!isTextOnlyMode && state.image) {
+      const response = await linkedInClient.createImagePost(
+        {
+          text: ensureSignature(linkedInPostText),
+          imageUrl: state.image.imageUrl,
+        },
+        {
+          postToOrganization: postToLinkedInOrg,
+        },
+      );
+      if (response && typeof response === "object" && "id" in response) {
+        linkedInPostUrn = (response as { id: string }).id;
+      }
+    } else {
+      const response = await linkedInClient.createTextPost(
+        ensureSignature(linkedInPostText),
+        {
+          postToOrganization: postToLinkedInOrg,
+        },
+      );
+      if (response && typeof response === "object" && "id" in response) {
+        linkedInPostUrn = (response as { id: string }).id;
+      }
+    }
+
+    console.log("✅ Successfully uploaded post to LinkedIn ✅");
+
+    if (linkedInPostUrn) {
+      await reshareFromMainLinkedInAccount(linkedInPostUrn);
+    }
+  } catch (e: any) {
+    console.error("Failed to upload post:", e);
+    let errorString = "";
+    if (typeof e === "object" && "message" in e) {
+      errorString = e.message;
+    } else {
+      errorString = e;
+    }
+    await postUploadFailureToSlack({
+      uploadDestination: "linkedin",
+      error: errorString,
+      threadId:
+        config.configurable?.thread_id || "no thread id found in configurable",
+      postContent: state.complexPost || state.post,
+      image: state.image,
+    });
+  }
+
+  try {
+    const instagramAccessToken =
+      process.env.INSTAGRAM_ACCESS_TOKEN ||
+      config.configurable?.[INSTAGRAM_ACCESS_TOKEN];
+    const instagramBusinessAccountId =
+      process.env.INSTAGRAM_BUSINESS_ACCOUNT_ID ||
+      config.configurable?.[INSTAGRAM_BUSINESS_ACCOUNT_ID];
+    // Instagram uploads are disabled by default to keep Instagram as a review-only draft in the dev inbox.
+    // To enable automatic Instagram uploads, set the env var `ENABLE_INSTAGRAM_UPLOAD=true`.
+    if (process.env.ENABLE_INSTAGRAM_UPLOAD === "true") {
+      if (!instagramAccessToken || !instagramBusinessAccountId) {
+        console.log("Instagram credentials not configured. Skipping Instagram post.");
+      } else if (!state.image?.imageUrl) {
+        console.log("Instagram post skipped because no image is available.");
+      } else {
+        const instagramClient = new InstagramClient({
+          accessToken: instagramAccessToken,
+          igUserId: instagramBusinessAccountId,
+        });
+
+        const instagramPostText = appendOriginalLink(
+          state.instagramPost || getPlatformPost(state.post, "instagram")
+        );
+
+        await instagramClient.createMediaPost({
+          caption: ensureSignature(instagramPostText),
+          imageUrl: state.image.imageUrl,
+          mediaType: "IMAGE",
+        });
+
+        console.log("✅ Successfully uploaded post to Instagram ✅");
+      }
+    } else {
+      console.log("Instagram upload skipped (dev review only). Set ENABLE_INSTAGRAM_UPLOAD=true to enable.");
+    }
+  } catch (e: any) {
+    console.error("Failed to upload post to Instagram:", e);
+    let errorString = "";
+    if (typeof e === "object" && "message" in e) {
+      errorString = e.message;
+    } else {
+      errorString = e;
+    }
+    await postUploadFailureToSlack({
+      uploadDestination: "instagram",
+      error: errorString,
+      threadId:
+        config.configurable?.thread_id || "no thread id found in configurable",
+      postContent: state.complexPost || state.post,
+      image: state.image,
+    });
+  }
+
+  return {};
+}
+
+const uploadPostWorkflow = new StateGraph(
+  UploadPostAnnotation,
+  UploadPostGraphConfiguration,
+)
+  .addNode("uploadPost", uploadPost)
+  .addEdge(START, "uploadPost")
+  .addEdge("uploadPost", END);
+
+export const uploadPostGraph = uploadPostWorkflow.compile();
+uploadPostGraph.name = "Upload Post Graph";
